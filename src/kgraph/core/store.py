@@ -171,10 +171,37 @@ class GraphStore:
                 })
             
             # Insert into LanceDB
-            if self.table is None:
-                self.table = self.lance_db.create_table("code_vectors", lance_data)
-            else:
-                self.table.add(lance_data)
+            # Insert into LanceDB with robust error handling
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    if self.table is None:
+                        try:
+                            # Try to open first (in case another process created it)
+                            self.table = self.lance_db.open_table("code_vectors")
+                            self.table.add(lance_data)
+                        except Exception:
+                            # Table doesn't exist, try to create
+                            try:
+                                self.table = self.lance_db.create_table("code_vectors", lance_data)
+                            except Exception as e:
+                                if "already exists" in str(e):
+                                    # Race condition: another process created it
+                                    self.table = self.lance_db.open_table("code_vectors")
+                                    self.table.add(lance_data)
+                                else:
+                                    raise e
+                    else:
+                        self.table.add(lance_data)
+                    break # Success
+                except Exception as e:
+                    if attempt == max_retries - 1:
+                        logger.error(f"Failed to write to LanceDB after {max_retries} attempts: {e}")
+                        # Don't raise, just log error to avoid crashing the whole indexing process
+                        # But this means vector search will be incomplete
+                    else:
+                        import time
+                        time.sleep(0.1 * (attempt + 1)) # Exponential backoff
 
     def add_edge(self, source_id: str, target_id: str, edge_type: str, properties: Dict[str, Any] = {}):
         conn = self._get_conn()
@@ -206,7 +233,9 @@ class GraphStore:
             return results
         except Exception as e:
             logger.error(f"Error searching LanceDB: {e}")
-            raise ValueError(f"Search failed: {e}. The vector database may be corrupted. Try reindexing.")
+            if "No such file or directory" in str(e) or "corrupt" in str(e).lower():
+                raise ValueError(f"Vector database corrupted or missing. Please run 'reindex_codebase' to fix it. Error: {e}")
+            raise ValueError(f"Search failed: {e}")
 
     def get_node(self, node_id: str) -> Optional[Dict[str, Any]]:
         conn = self._get_conn()

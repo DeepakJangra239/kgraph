@@ -57,6 +57,14 @@ code:
         (variable_declarator
           name: (identifier) @func.name
           value: [(arrow_function) (function_expression)]) @func.def
+        
+        ; Wrapped functions (e.g. useCallback, debounce)
+        (variable_declarator
+          name: (identifier) @func.name
+          value: (call_expression
+            arguments: (arguments [(arrow_function) (function_expression)])
+          )
+        ) @func.def
       ]
     
     calls: |
