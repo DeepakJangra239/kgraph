@@ -277,6 +277,49 @@ class GraphStore:
             results.append(d)
         return results
 
+    def resolve_unknown_edges(self):
+        """Resolves edges with UNKNOWN targets to actual nodes."""
+        conn = self._get_conn()
+        cursor = conn.cursor()
+        
+        cursor.execute("SELECT source_id, target_id, type, properties FROM edges WHERE target_id LIKE 'UNKNOWN:%'")
+        unknown_edges = cursor.fetchall()
+        
+        for edge in unknown_edges:
+            source_id, target_id, edge_type, props_json = edge
+            try:
+                name = target_id.split(":", 1)[1]
+            except IndexError:
+                continue
+            
+            props = json.loads(props_json) if props_json else {}
+            module_hint = props.get('module_hint')
+            
+            nodes = self.find_nodes_by_name(name)
+            if nodes:
+                candidates = nodes
+                if module_hint:
+                    # Normalize module hint (replace dots with slashes for path matching)
+                    # e.g. "app.services.nse_service" -> "app/services/nse_service"
+                    hint_path = module_hint.replace(".", "/")
+                    
+                    filtered = [n for n in nodes if hint_path in n['file_path']]
+                    if filtered:
+                        candidates = filtered
+                
+                for node in candidates:
+                    try:
+                        cursor.execute("""
+                            INSERT OR IGNORE INTO edges (source_id, target_id, type, properties)
+                            VALUES (?, ?, ?, ?)
+                        """, (source_id, node['id'], edge_type, props_json))
+                    except Exception:
+                        pass
+                
+                cursor.execute("DELETE FROM edges WHERE source_id=? AND target_id=? AND type=?", (source_id, target_id, edge_type))
+        
+        conn.commit()
+
     def close(self):
         if hasattr(self._local, 'conn'):
             self._local.conn.close()

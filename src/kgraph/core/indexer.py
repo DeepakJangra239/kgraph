@@ -175,6 +175,10 @@ class CodeIndexer:
         # Signal consumer to stop and wait for it
         stop_event.set()
         consumer_thread.join()
+        
+        # Post-processing: Resolve UNKNOWN edges (Imports/Inheritance)
+        print("Linking graph edges...")
+        self.store.resolve_unknown_edges()
 
     def _process_file(self, file_path: str) -> Tuple[List[Dict], List[Dict]]:
         """Parse file and return nodes/edges without writing to DB."""
@@ -227,42 +231,94 @@ class CodeIndexer:
             parser = self.parsers[ext]
             tree = parser.parse(bytes(code, "utf8"))
             
-            # Extract Definitions
-            def_nodes, def_edges = self._extract_definitions_data(tree.root_node, file_id, file_path, code)
+            # Extract Definitions & Imports
+            def_nodes, def_edges, import_map = self._extract_definitions_data(tree.root_node, file_id, file_path, code)
             nodes.extend(def_nodes)
             edges.extend(def_edges)
             
-            # Extract References
-            ref_edges = self._extract_references_data(tree.root_node, file_id, file_path, code)
+            # Extract References using Import Map
+            ref_edges = self._extract_references_data(tree.root_node, file_id, file_path, code, import_map)
             edges.extend(ref_edges)
         except Exception as e:
             logger.error(f"Error parsing {file_path}: {e}")
             
         return nodes, edges
 
-    def _extract_definitions_data(self, node, parent_id: str, file_path: str, code: str) -> Tuple[List[Dict], List[Dict]]:
+    def _extract_definitions_data(self, node, parent_id: str, file_path: str, code: str) -> Tuple[List[Dict], List[Dict], Dict[str, str]]:
         nodes = []
         edges = []
+        import_map = {}
         
-        # Imports (Python, JS, Java)
-        if node.type in ["import_statement", "import_from_statement", "import_declaration"]:
-            import_text = code[node.start_byte:node.end_byte]
-            node_id = f"IMPORT:{file_path}:{node.start_point[0]}"
-            
-            nodes.append({
-                "node_id": node_id,
-                "node_type": "IMPORT",
-                "name": import_text.split('\n')[0],
-                "file_path": file_path,
-                "start_line": node.start_point[0] + 1,
-                "end_line": node.end_point[0] + 1,
-                "code_content": import_text
-            })
-            edges.append({
-                "source_id": parent_id,
-                "target_id": node_id,
-                "edge_type": "IMPORTS"
-            })
+        # Imports (Python)
+        if node.type == "import_from_statement":
+            module_node = node.child_by_field_name("module_name")
+            if module_node:
+                module_name = code[module_node.start_byte:module_node.end_byte]
+                for child in node.children:
+                    if child.type == "dotted_name" and child != module_node:
+                        name = code[child.start_byte:child.end_byte]
+                        import_map[name] = module_name
+                        
+                        # Create IMPORT node
+                        import_id = f"IMPORT:{file_path}:{name}:{child.start_point[0]}"
+                        nodes.append({
+                            "node_id": import_id,
+                            "node_type": "IMPORT",
+                            "name": name,
+                            "file_path": file_path,
+                            "start_line": child.start_point[0] + 1,
+                            "end_line": child.end_point[0] + 1,
+                            "properties": {"from_module": module_name},
+                            "code_content": f"from {module_name} import {name}"
+                        })
+                        edges.append({
+                            "source_id": parent_id,
+                            "target_id": import_id,
+                            "edge_type": "CONTAINS"
+                        })
+                        edges.append({
+                            "source_id": import_id,
+                            "target_id": f"UNKNOWN:{name}",
+                            "edge_type": "IMPORTS"
+                        })
+        
+        # Imports (JS/TS)
+        elif node.type == "import_statement":
+            source_node = node.child_by_field_name("source")
+            if source_node:
+                source = code[source_node.start_byte:source_node.end_byte].strip('"\'')
+                import_clause = node.child_by_field_name("import_clause")
+                if import_clause:
+                    named_imports = import_clause.child_by_field_name("named_imports")
+                    if named_imports:
+                        for child in named_imports.children:
+                            if child.type == "import_specifier":
+                                name_node = child.child_by_field_name("name")
+                                if name_node:
+                                    name = code[name_node.start_byte:name_node.end_byte]
+                                    import_map[name] = source
+                                    
+                                    import_id = f"IMPORT:{file_path}:{name}:{child.start_point[0]}"
+                                    nodes.append({
+                                        "node_id": import_id,
+                                        "node_type": "IMPORT",
+                                        "name": name,
+                                        "file_path": file_path,
+                                        "start_line": child.start_point[0] + 1,
+                                        "end_line": child.end_point[0] + 1,
+                                        "properties": {"from_module": source},
+                                        "code_content": f"import {{ {name} }} from '{source}'"
+                                    })
+                                    edges.append({
+                                        "source_id": parent_id,
+                                        "target_id": import_id,
+                                        "edge_type": "CONTAINS"
+                                    })
+                                    edges.append({
+                                        "source_id": import_id,
+                                        "target_id": f"UNKNOWN:{name}",
+                                        "edge_type": "IMPORTS"
+                                    })
 
         # Python definitions
         if node.type in ["function_definition", "class_definition"]:
@@ -297,6 +353,20 @@ class CodeIndexer:
                     "edge_type": "DEFINES"
                 })
                 
+                # Inheritance (Python)
+                if node_type == "CLASS":
+                    superclasses = node.child_by_field_name("superclasses")
+                    if superclasses:
+                        for child in superclasses.children:
+                            if child.type == "identifier":
+                                base = code[child.start_byte:child.end_byte]
+                                edges.append({
+                                    "source_id": node_id,
+                                    "target_id": f"UNKNOWN:{base}",
+                                    "edge_type": "INHERITS_FROM",
+                                    "properties": {"base_class": base}
+                                })
+                
                 parent_id = node_id
 
         # JavaScript definitions
@@ -321,6 +391,23 @@ class CodeIndexer:
                     "target_id": node_id,
                     "edge_type": "DEFINES"
                 })
+                
+                # Inheritance (JS)
+                if node_type == "CLASS":
+                    heritage = node.child_by_field_name("class_heritage")
+                    if heritage:
+                        for child in heritage.children:
+                            if child.type == "extends_clause":
+                                value = child.child_by_field_name("value")
+                                if value:
+                                    base = code[value.start_byte:value.end_byte]
+                                    edges.append({
+                                        "source_id": node_id,
+                                        "target_id": f"UNKNOWN:{base}",
+                                        "edge_type": "INHERITS_FROM",
+                                        "properties": {"base_class": base}
+                                    })
+
                 parent_id = node_id
 
         # Java definitions
@@ -345,74 +432,95 @@ class CodeIndexer:
                     "target_id": node_id,
                     "edge_type": "DEFINES"
                 })
+                
+                # Inheritance (Java)
+                if node_type == "CLASS":
+                    superclass = node.child_by_field_name("superclass")
+                    if superclass:
+                         base = code[superclass.start_byte:superclass.end_byte]
+                         if base.startswith("extends "):
+                             base = base[8:].strip()
+                         edges.append({
+                            "source_id": node_id,
+                            "target_id": f"UNKNOWN:{base}",
+                            "edge_type": "INHERITS_FROM",
+                            "properties": {"base_class": base}
+                        })
+
                 parent_id = node_id
 
         for child in node.children:
-            n, e = self._extract_definitions_data(child, parent_id, file_path, code)
-            nodes.extend(n)
-            edges.extend(e)
+            c_nodes, c_edges, c_imports = self._extract_definitions_data(child, parent_id, file_path, code)
+            nodes.extend(c_nodes)
+            edges.extend(c_edges)
+            import_map.update(c_imports)
             
-        return nodes, edges
+        return nodes, edges, import_map
 
-    def _extract_references_data(self, node, source_id: str, file_path: str, code: str) -> List[Dict]:
+    def _resolve_targets(self, call_name: str, import_map: Dict[str, str]) -> List[Dict]:
+        potential_targets = self.store.find_nodes_by_name(call_name)
+        if call_name in import_map:
+            module_hint = import_map[call_name]
+            refined = [t for t in potential_targets if module_hint in t['file_path']]
+            if refined:
+                return refined
+        return potential_targets
+
+    def _extract_references_data(self, node, source_id: str, file_path: str, code: str, import_map: Dict[str, str] = None) -> List[Dict]:
+        if import_map is None: import_map = {}
         edges = []
         
-        # Python Call (includes both function calls and class instantiation)
+        # Python Call
         if node.type == "call":
             func_node = node.child_by_field_name("function")
             if func_node:
                 call_text = code[func_node.start_byte:func_node.end_byte]
-                
-                # Extract all potential target names
-                # For obj.method() -> extract "method"
-                # For ClassName() -> extract "ClassName"
-                # For module.Class() -> extract "Class"
                 call_names = set()
-                
                 if "." in call_text:
-                    # Handle obj.method() or module.Class()
                     parts = call_text.split(".")
-                    call_names.add(parts[-1])  # Last part (method/class name)
+                    call_names.add(parts[-1])
                     if len(parts) == 2:
-                        call_names.add(parts[0])  # First part might be class name
+                        call_names.add(parts[0])
                 else:
                     call_names.add(call_text)
                 
                 for call_name in call_names:
-                    if call_name and not call_name.startswith("_"):  # Skip special methods
-                        potential_targets = self.store.find_nodes_by_name(call_name)
-                        for target in potential_targets:
-                            edges.append({
-                                "source_id": source_id,
-                                "target_id": target['id'],
-                                "edge_type": "CALLS"
-                            })
+                    if call_name and not call_name.startswith("_"):
+                        props = {}
+                        if call_name in import_map:
+                            props['module_hint'] = import_map[call_name]
+                        
+                        edges.append({
+                            "source_id": source_id,
+                            "target_id": f"UNKNOWN:{call_name}",
+                            "edge_type": "CALLS",
+                            "properties": props
+                        })
 
-        # JavaScript/TypeScript Call (call_expression and new_expression)
+        # JS/TS Call
         if node.type in ["call_expression", "new_expression"]:
-            # Handle both regular calls and 'new ClassName()'
             if node.type == "new_expression":
-                # new ClassName()
                 class_node = node.child_by_field_name("constructor")
                 if class_node:
                     class_name = code[class_node.start_byte:class_node.end_byte]
                     if "." in class_name:
                         class_name = class_name.split(".")[-1]
                     
-                    potential_targets = self.store.find_nodes_by_name(class_name)
-                    for target in potential_targets:
-                        edges.append({
-                            "source_id": source_id,
-                            "target_id": target['id'],
-                            "edge_type": "CALLS"
-                        })
+                    props = {}
+                    if class_name in import_map:
+                        props['module_hint'] = import_map[class_name]
+                    
+                    edges.append({
+                        "source_id": source_id,
+                        "target_id": f"UNKNOWN:{class_name}",
+                        "edge_type": "CALLS",
+                        "properties": props
+                    })
             else:
-                # Regular function call
                 func_node = node.child_by_field_name("function")
                 if func_node:
                     call_text = code[func_node.start_byte:func_node.end_byte]
                     call_names = set()
-                    
                     if "." in call_text:
                         parts = call_text.split(".")
                         call_names.add(parts[-1])
@@ -421,45 +529,52 @@ class CodeIndexer:
                     
                     for call_name in call_names:
                         if call_name:
-                            potential_targets = self.store.find_nodes_by_name(call_name)
-                            for target in potential_targets:
-                                edges.append({
-                                    "source_id": source_id,
-                                    "target_id": target['id'],
-                                    "edge_type": "CALLS"
-                                })
+                            props = {}
+                            if call_name in import_map:
+                                props['module_hint'] = import_map[call_name]
+                            
+                            edges.append({
+                                "source_id": source_id,
+                                "target_id": f"UNKNOWN:{call_name}",
+                                "edge_type": "CALLS",
+                                "properties": props
+                            })
 
-        # Java Call (method_invocation and object_creation_expression)
+        # Java Call
         if node.type in ["method_invocation", "object_creation_expression"]:
             if node.type == "object_creation_expression":
-                # new ClassName()
                 type_node = node.child_by_field_name("type")
                 if type_node:
                     class_name = code[type_node.start_byte:type_node.end_byte]
-                    # Remove generic types: ClassName<T> -> ClassName
                     if "<" in class_name:
                         class_name = class_name.split("<")[0]
                     
-                    potential_targets = self.store.find_nodes_by_name(class_name)
-                    for target in potential_targets:
-                        edges.append({
-                            "source_id": source_id,
-                            "target_id": target['id'],
-                            "edge_type": "CALLS"
-                        })
+                    props = {}
+                    if class_name in import_map:
+                        props['module_hint'] = import_map[class_name]
+                    
+                    edges.append({
+                        "source_id": source_id,
+                        "target_id": f"UNKNOWN:{class_name}",
+                        "edge_type": "CALLS",
+                        "properties": props
+                    })
             else:
-                # Regular method call
                 name_node = node.child_by_field_name("name")
                 if name_node:
                     call_name = code[name_node.start_byte:name_node.end_byte]
                     
-                    potential_targets = self.store.find_nodes_by_name(call_name)
-                    for target in potential_targets:
-                        edges.append({
-                            "source_id": source_id,
-                            "target_id": target['id'],
-                            "edge_type": "CALLS"
-                        })
+                    props = {}
+                    if call_name in import_map:
+                        props['module_hint'] = import_map[call_name]
+                    
+                    edges.append({
+                        "source_id": source_id,
+                        "target_id": f"UNKNOWN:{call_name}",
+                        "edge_type": "CALLS",
+                        "properties": props
+                    })
+
         new_source_id = source_id
         if node.type in ["function_definition", "class_definition", "function_declaration", "method_definition", "class_declaration", "interface_declaration", "enum_declaration", "method_declaration", "constructor_declaration"]:
              name_node = node.child_by_field_name("name")
@@ -469,7 +584,7 @@ class CodeIndexer:
                 new_source_id = f"{node_type}:{file_path}:{name}"
 
         for child in node.children:
-            edges.extend(self._extract_references_data(child, new_source_id, file_path, code))
+            edges.extend(self._extract_references_data(child, new_source_id, file_path, code, import_map))
             
         return edges
 
@@ -565,29 +680,96 @@ class CodeIndexer:
         
         return called_functions
 
-    def extract_definitions_from_text(self, code: str, file_path: str) -> List[str]:
+    def extract_definitions_from_text(self, code: str, file_path: str) -> Dict[str, str]:
         """
-        Parses code and returns a list of defined symbol names (functions/classes).
+        Parses code and returns a dict of defined symbol names to their signatures.
         Used for impact analysis.
         """
         ext = os.path.splitext(file_path)[1]
         if ext not in self.parsers:
-            return []
+            return {}
             
         parser = self.parsers[ext]
         tree = parser.parse(bytes(code, "utf8"))
         
-        definitions = []
+        definitions = {}
         
         def _visit(node):
-            if node.type in ["function_definition", "class_definition", "function_declaration", "class_declaration", "method_definition"]:
+            if node.type in ["function_definition", "function_declaration", "method_definition"]:
+                name_node = node.child_by_field_name("name")
+                params_node = node.child_by_field_name("parameters")
+                if not params_node:
+                    params_node = node.child_by_field_name("formal_parameters")
+                
+                if name_node:
+                    name = code[name_node.start_byte:name_node.end_byte]
+                    signature = ""
+                    if params_node:
+                        signature = code[params_node.start_byte:params_node.end_byte]
+                    definitions[name] = signature
+
+            elif node.type in ["class_definition", "class_declaration"]:
                 name_node = node.child_by_field_name("name")
                 if name_node:
                     name = code[name_node.start_byte:name_node.end_byte]
-                    definitions.append(name)
+                    definitions[name] = "class"
+            
             for child in node.children:
                 _visit(child)
                 
         _visit(tree.root_node)
         return definitions
 
+
+    def extract_imports(self, code: str, file_path: str) -> Set[str]:
+        """
+        Parses code and returns a set of imported symbol names.
+        Used for validation.
+        """
+        ext = os.path.splitext(file_path)[1]
+        if ext not in self.parsers:
+            return set()
+            
+        parser = self.parsers[ext]
+        tree = parser.parse(bytes(code, "utf8"))
+        
+        imports = set()
+        
+        def _visit(node):
+            # Python imports
+            if node.type == "import_from_statement":
+                for child in node.children:
+                    if child.type == "dotted_name" and child.prev_sibling.type == "import":
+                        name = code[child.start_byte:child.end_byte]
+                        imports.add(name)
+                    elif child.type == "aliased_import":
+                        alias = child.child_by_field_name("alias")
+                        if alias:
+                            imports.add(code[alias.start_byte:alias.end_byte])
+            elif node.type == "import_statement":
+                for child in node.children:
+                    if child.type == "dotted_name":
+                        name = code[child.start_byte:child.end_byte]
+                        imports.add(name.split('.')[0]) # Add top-level package
+                    elif child.type == "aliased_import":
+                        alias = child.child_by_field_name("alias")
+                        if alias:
+                            imports.add(code[alias.start_byte:alias.end_byte])
+            
+            # JS/TS imports
+            elif node.type == "import_statement":
+                clause = node.child_by_field_name("clause")
+                if clause:
+                    named_imports = clause.child_by_field_name("named_imports")
+                    if named_imports:
+                        for child in named_imports.children:
+                            if child.type == "import_specifier":
+                                name = child.child_by_field_name("name")
+                                if name:
+                                    imports.add(code[name.start_byte:name.end_byte])
+            
+            for child in node.children:
+                _visit(child)
+                
+        _visit(tree.root_node)
+        return imports
