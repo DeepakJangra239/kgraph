@@ -1406,9 +1406,10 @@ wheels = [
 
 [[package]]
 name = "kgraph"
-version = "0.3.1"
+version = "0.4.0"
 source = { editable = "." }
 dependencies = [
+    { name = "lance-namespace" },
     { name = "lancedb" },
     { name = "mcp", extra = ["cli"] },
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
@@ -1430,6 +1431,7 @@ mlx = [
 
 [package.metadata]
 requires-dist = [
+    { name = "lance-namespace", specifier = "==0.0.21" },
     { name = "lancedb" },
     { name = "mcp", extras = ["cli"] },
     { name = "mlx", marker = "extra == 'mlx'" },

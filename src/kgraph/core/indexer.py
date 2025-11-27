@@ -3,13 +3,10 @@ import glob
 import time
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import List, Dict, Tuple, Iterator
-import tree_sitter_python
-import tree_sitter_javascript
-import tree_sitter_java
-from tree_sitter import Language, Parser
+from typing import List, Dict, Tuple, Iterator, Set
 
 from .store import GraphStore
+from .language_registry import LanguageRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -28,43 +25,21 @@ IGNORED_DIRS = {
 class CodeIndexer:
     def __init__(self, store: GraphStore):
         self.store = store
-        self.parsers = {}
-        self._init_parsers()
-
-    def _init_parsers(self):
-        try:
-            PY_LANGUAGE = Language(tree_sitter_python.language())
-            JS_LANGUAGE = Language(tree_sitter_javascript.language())
-            JAVA_LANGUAGE = Language(tree_sitter_java.language())
-            
-            import tree_sitter_go
-            GO_LANGUAGE = Language(tree_sitter_go.language())
-            
-            import tree_sitter_typescript
-            TS_LANGUAGE = Language(tree_sitter_typescript.language_typescript())
-            TSX_LANGUAGE = Language(tree_sitter_typescript.language_tsx())
-            
-            self.parsers[".py"] = Parser(PY_LANGUAGE)
-            self.parsers[".js"] = Parser(JS_LANGUAGE)
-            self.parsers[".jsx"] = Parser(JS_LANGUAGE)
-            self.parsers[".ts"] = Parser(TS_LANGUAGE)
-            self.parsers[".tsx"] = Parser(TSX_LANGUAGE)
-            self.parsers[".java"] = Parser(JAVA_LANGUAGE)
-            self.parsers[".go"] = Parser(GO_LANGUAGE)
-        except Exception as e:
-            logger.error(f"Error initializing parsers: {e}")
+        self.registry = LanguageRegistry()
+        logger.info(f"Initialized CodeIndexer with languages: {self.registry.list_supported_languages()}")
 
     def stream_files(self, root_path: str) -> Iterator[str]:
         """Yields absolute file paths to index."""
         root_path = os.path.abspath(root_path)
-        for ext in self.parsers.keys():
-            pattern = os.path.join(root_path, "**", f"*{ext}")
-            for file_path in glob.glob(pattern, recursive=True):
-                # Check if any part of the path is in IGNORED_DIRS
-                parts = file_path.split(os.sep)
-                if any(part in IGNORED_DIRS for part in parts):
-                    continue
-                yield os.path.abspath(file_path)
+        # Walk directory tree
+        for dirpath, dirnames, filenames in os.walk(root_path):
+            # Filter directories
+            dirnames[:] = [d for d in dirnames if d not in IGNORED_DIRS]
+            
+            for filename in filenames:
+                file_path = os.path.join(dirpath, filename)
+                if self.registry.supports(file_path):
+                    yield file_path
 
     def process_file_stream(self, file_paths: Iterator[str]) -> Iterator[Tuple[List[Dict], List[Dict]]]:
         """
@@ -123,9 +98,14 @@ class CodeIndexer:
                     batch_edges.extend(edges)
                     
                     if len(batch_nodes) >= BATCH_SIZE:
-                        self.store.add_nodes_batch(batch_nodes)
-                        for edge in batch_edges:
-                            self.store.add_edge(**edge)
+                        try:
+                            self.store.add_nodes_batch(batch_nodes)
+                            for edge in batch_edges:
+                                self.store.add_edge(**edge)
+                        except Exception as e:
+                            logger.error(f"Error adding batch to database: {e}")
+                            import traceback
+                            traceback.print_exc()
                         batch_nodes = []
                         batch_edges = []
                     
@@ -134,12 +114,19 @@ class CodeIndexer:
                     continue
                 except Exception as e:
                     logger.error(f"Error in worker: {e}")
+                    import traceback
+                    traceback.print_exc()
             
             # Flush remaining
             if batch_nodes or batch_edges:
-                self.store.add_nodes_batch(batch_nodes)
-                for edge in batch_edges:
-                    self.store.add_edge(**edge)
+                try:
+                    self.store.add_nodes_batch(batch_nodes)
+                    for edge in batch_edges:
+                        self.store.add_edge(**edge)
+                except Exception as e:
+                    logger.error(f"Error flushing final batch: {e}")
+                    import traceback
+                    traceback.print_exc()
 
         # Start consumer thread
         consumer_thread = threading.Thread(target=worker, daemon=True)
@@ -175,11 +162,15 @@ class CodeIndexer:
         # Signal consumer to stop and wait for it
         stop_event.set()
         consumer_thread.join()
+        
+        # Post-processing: Resolve UNKNOWN edges (Imports/Inheritance)
+        print("Linking graph edges...")
+        self.store.resolve_unknown_edges()
 
     def _process_file(self, file_path: str) -> Tuple[List[Dict], List[Dict]]:
         """Parse file and return nodes/edges without writing to DB."""
-        ext = os.path.splitext(file_path)[1]
-        if ext not in self.parsers:
+        handler = self.registry.get_handler(file_path)
+        if not handler:
             return [], []
 
         try:
@@ -194,24 +185,19 @@ class CodeIndexer:
         file_hash = hashlib.md5(code.encode('utf-8')).hexdigest()
         file_id = f"file:{file_path}"
         
-        # We need to access store to check hash. 
-        # Since we are in a thread, store._get_conn() will create a new connection for this thread.
-        # This is safe because we are only reading.
         try:
             existing_node = self.store.get_node(file_id)
             if existing_node:
                 props = existing_node.get('properties', {})
                 if props.get('hash') == file_hash:
-                    # File unchanged, skip parsing and embedding!
                     return [], []
         except Exception as e:
-            # If DB lookup fails, just proceed with indexing
             logger.warning(f"Error checking hash for {file_path}: {e}")
 
         nodes = []
         edges = []
 
-        # Create File Node with Hash
+        # Create File Node
         nodes.append({
             "node_id": file_id,
             "node_type": "FILE",
@@ -224,266 +210,97 @@ class CodeIndexer:
         })
 
         try:
-            parser = self.parsers[ext]
-            tree = parser.parse(bytes(code, "utf8"))
+            # Parse Code if applicable
+            tree = None
+            if handler.parser:
+                tree = handler.parser.parse(bytes(code, "utf8"))
             
+            # Extract Imports
+            imports = handler.extract_imports(tree, code, file_path)
+            import_map = {}
+            for imp in imports:
+                import_id = f"IMPORT:{file_path}:{imp.symbol}:{imp.line}"
+                import_map[imp.symbol] = imp.module
+                
+                nodes.append({
+                    "node_id": import_id,
+                    "node_type": "IMPORT",
+                    "name": imp.symbol,
+                    "file_path": file_path,
+                    "start_line": imp.line,
+                    "end_line": imp.line, # Approximate
+                    "properties": {"from_module": imp.module, "full_import": imp.full_import},
+                    "code_content": imp.full_import or f"import {imp.symbol}"
+                })
+                edges.append({
+                    "source_id": file_id,
+                    "target_id": import_id,
+                    "edge_type": "CONTAINS"
+                })
+                edges.append({
+                    "source_id": import_id,
+                    "target_id": f"UNKNOWN:{imp.symbol}",
+                    "edge_type": "IMPORTS"
+                })
+
             # Extract Definitions
-            def_nodes, def_edges = self._extract_definitions_data(tree.root_node, file_id, file_path, code)
-            nodes.extend(def_nodes)
-            edges.extend(def_edges)
+            definitions = handler.extract_definitions(tree, code, file_path, file_id)
+            for definition in definitions:
+                def_id = f"{definition.kind}:{file_path}:{definition.name}"
+                nodes.append({
+                    "node_id": def_id,
+                    "node_type": definition.kind,
+                    "name": definition.name,
+                    "file_path": file_path,
+                    "start_line": definition.start_line,
+                    "end_line": definition.end_line,
+                    "properties": {"docstring": definition.docstring},
+                    "code_content": definition.code
+                })
+                edges.append({
+                    "source_id": file_id, # Simplified: Flattened hierarchy for now (TODO: Nested)
+                    "target_id": def_id,
+                    "edge_type": "DEFINES"
+                })
+                
+                # TODO: Handle inheritance edges if handler supports it (not yet in UniversalHandler base)
             
             # Extract References
-            ref_edges = self._extract_references_data(tree.root_node, file_id, file_path, code)
-            edges.extend(ref_edges)
+            references = handler.extract_references(tree, code, file_path, file_id, import_map)
+            for ref in references:
+                # Find parent definition for this reference based on line number
+                parent_id = file_id
+                for definition in definitions:
+                    if definition.start_line <= ref.line <= definition.end_line:
+                        # Use the most specific (smallest range) definition
+                        parent_id = f"{definition.kind}:{file_path}:{definition.name}"
+                
+                props = {}
+                if ref.module_hint:
+                    props['module_hint'] = ref.module_hint
+                    
+                edges.append({
+                    "source_id": parent_id,
+                    "target_id": f"UNKNOWN:{ref.name}",
+                    "edge_type": "CALLS",
+                    "properties": props
+                })
+
         except Exception as e:
             logger.error(f"Error parsing {file_path}: {e}")
             
         return nodes, edges
-
-    def _extract_definitions_data(self, node, parent_id: str, file_path: str, code: str) -> Tuple[List[Dict], List[Dict]]:
-        nodes = []
-        edges = []
-        
-        # Imports (Python, JS, Java)
-        if node.type in ["import_statement", "import_from_statement", "import_declaration"]:
-            import_text = code[node.start_byte:node.end_byte]
-            node_id = f"IMPORT:{file_path}:{node.start_point[0]}"
-            
-            nodes.append({
-                "node_id": node_id,
-                "node_type": "IMPORT",
-                "name": import_text.split('\n')[0],
-                "file_path": file_path,
-                "start_line": node.start_point[0] + 1,
-                "end_line": node.end_point[0] + 1,
-                "code_content": import_text
-            })
-            edges.append({
-                "source_id": parent_id,
-                "target_id": node_id,
-                "edge_type": "IMPORTS"
-            })
-
-        # Python definitions
-        if node.type in ["function_definition", "class_definition"]:
-            name_node = node.child_by_field_name("name")
-            if name_node:
-                name = code[name_node.start_byte:name_node.end_byte]
-                node_type = "FUNCTION" if node.type == "function_definition" else "CLASS"
-                node_id = f"{node_type}:{file_path}:{name}"
-                
-                docstring = ""
-                if node.child_count > 0 and node.children[-1].type == "block":
-                    block = node.children[-1]
-                    if block.child_count > 0 and block.children[0].type == "expression_statement":
-                        expr = block.children[0]
-                        if expr.child_count > 0 and expr.children[0].type == "string":
-                            docstring = code[expr.children[0].start_byte:expr.children[0].end_byte]
-
-                nodes.append({
-                    "node_id": node_id,
-                    "node_type": node_type,
-                    "name": name,
-                    "file_path": file_path,
-                    "start_line": node.start_point[0] + 1,
-                    "end_line": node.end_point[0] + 1,
-                    "properties": {"docstring": docstring},
-                    "code_content": code[node.start_byte:node.end_byte]
-                })
-
-                edges.append({
-                    "source_id": parent_id,
-                    "target_id": node_id,
-                    "edge_type": "DEFINES"
-                })
-                
-                parent_id = node_id
-
-        # JavaScript definitions
-        elif node.type in ["function_declaration", "class_declaration", "method_definition"]:
-             name_node = node.child_by_field_name("name")
-             if name_node:
-                name = code[name_node.start_byte:name_node.end_byte]
-                node_type = "FUNCTION" if "function" in node.type or "method" in node.type else "CLASS"
-                node_id = f"{node_type}:{file_path}:{name}"
-                
-                nodes.append({
-                    "node_id": node_id,
-                    "node_type": node_type,
-                    "name": name,
-                    "file_path": file_path,
-                    "start_line": node.start_point[0] + 1,
-                    "end_line": node.end_point[0] + 1,
-                    "code_content": code[node.start_byte:node.end_byte]
-                })
-                edges.append({
-                    "source_id": parent_id,
-                    "target_id": node_id,
-                    "edge_type": "DEFINES"
-                })
-                parent_id = node_id
-
-        # Java definitions
-        elif node.type in ["class_declaration", "interface_declaration", "enum_declaration", "method_declaration", "constructor_declaration"]:
-             name_node = node.child_by_field_name("name")
-             if name_node:
-                name = code[name_node.start_byte:name_node.end_byte]
-                node_type = "FUNCTION" if "method" in node.type or "constructor" in node.type else "CLASS"
-                node_id = f"{node_type}:{file_path}:{name}"
-                
-                nodes.append({
-                    "node_id": node_id,
-                    "node_type": node_type,
-                    "name": name,
-                    "file_path": file_path,
-                    "start_line": node.start_point[0] + 1,
-                    "end_line": node.end_point[0] + 1,
-                    "code_content": code[node.start_byte:node.end_byte]
-                })
-                edges.append({
-                    "source_id": parent_id,
-                    "target_id": node_id,
-                    "edge_type": "DEFINES"
-                })
-                parent_id = node_id
-
-        for child in node.children:
-            n, e = self._extract_definitions_data(child, parent_id, file_path, code)
-            nodes.extend(n)
-            edges.extend(e)
-            
-        return nodes, edges
-
-    def _extract_references_data(self, node, source_id: str, file_path: str, code: str) -> List[Dict]:
-        edges = []
-        
-        # Python Call (includes both function calls and class instantiation)
-        if node.type == "call":
-            func_node = node.child_by_field_name("function")
-            if func_node:
-                call_text = code[func_node.start_byte:func_node.end_byte]
-                
-                # Extract all potential target names
-                # For obj.method() -> extract "method"
-                # For ClassName() -> extract "ClassName"
-                # For module.Class() -> extract "Class"
-                call_names = set()
-                
-                if "." in call_text:
-                    # Handle obj.method() or module.Class()
-                    parts = call_text.split(".")
-                    call_names.add(parts[-1])  # Last part (method/class name)
-                    if len(parts) == 2:
-                        call_names.add(parts[0])  # First part might be class name
-                else:
-                    call_names.add(call_text)
-                
-                for call_name in call_names:
-                    if call_name and not call_name.startswith("_"):  # Skip special methods
-                        potential_targets = self.store.find_nodes_by_name(call_name)
-                        for target in potential_targets:
-                            edges.append({
-                                "source_id": source_id,
-                                "target_id": target['id'],
-                                "edge_type": "CALLS"
-                            })
-
-        # JavaScript/TypeScript Call (call_expression and new_expression)
-        if node.type in ["call_expression", "new_expression"]:
-            # Handle both regular calls and 'new ClassName()'
-            if node.type == "new_expression":
-                # new ClassName()
-                class_node = node.child_by_field_name("constructor")
-                if class_node:
-                    class_name = code[class_node.start_byte:class_node.end_byte]
-                    if "." in class_name:
-                        class_name = class_name.split(".")[-1]
-                    
-                    potential_targets = self.store.find_nodes_by_name(class_name)
-                    for target in potential_targets:
-                        edges.append({
-                            "source_id": source_id,
-                            "target_id": target['id'],
-                            "edge_type": "CALLS"
-                        })
-            else:
-                # Regular function call
-                func_node = node.child_by_field_name("function")
-                if func_node:
-                    call_text = code[func_node.start_byte:func_node.end_byte]
-                    call_names = set()
-                    
-                    if "." in call_text:
-                        parts = call_text.split(".")
-                        call_names.add(parts[-1])
-                    else:
-                        call_names.add(call_text)
-                    
-                    for call_name in call_names:
-                        if call_name:
-                            potential_targets = self.store.find_nodes_by_name(call_name)
-                            for target in potential_targets:
-                                edges.append({
-                                    "source_id": source_id,
-                                    "target_id": target['id'],
-                                    "edge_type": "CALLS"
-                                })
-
-        # Java Call (method_invocation and object_creation_expression)
-        if node.type in ["method_invocation", "object_creation_expression"]:
-            if node.type == "object_creation_expression":
-                # new ClassName()
-                type_node = node.child_by_field_name("type")
-                if type_node:
-                    class_name = code[type_node.start_byte:type_node.end_byte]
-                    # Remove generic types: ClassName<T> -> ClassName
-                    if "<" in class_name:
-                        class_name = class_name.split("<")[0]
-                    
-                    potential_targets = self.store.find_nodes_by_name(class_name)
-                    for target in potential_targets:
-                        edges.append({
-                            "source_id": source_id,
-                            "target_id": target['id'],
-                            "edge_type": "CALLS"
-                        })
-            else:
-                # Regular method call
-                name_node = node.child_by_field_name("name")
-                if name_node:
-                    call_name = code[name_node.start_byte:name_node.end_byte]
-                    
-                    potential_targets = self.store.find_nodes_by_name(call_name)
-                    for target in potential_targets:
-                        edges.append({
-                            "source_id": source_id,
-                            "target_id": target['id'],
-                            "edge_type": "CALLS"
-                        })
-        new_source_id = source_id
-        if node.type in ["function_definition", "class_definition", "function_declaration", "method_definition", "class_declaration", "interface_declaration", "enum_declaration", "method_declaration", "constructor_declaration"]:
-             name_node = node.child_by_field_name("name")
-             if name_node:
-                name = code[name_node.start_byte:name_node.end_byte]
-                node_type = "FUNCTION" if "function" in node.type or "method" in node.type else "CLASS"
-                new_source_id = f"{node_type}:{file_path}:{name}"
-
-        for child in node.children:
-            edges.extend(self._extract_references_data(child, new_source_id, file_path, code))
-            
-        return edges
 
     def validate_syntax(self, code: str, file_path: str) -> List[str]:
         """
         Checks for syntax errors in the provided code.
         Returns a list of error messages.
         """
-        ext = os.path.splitext(file_path)[1]
-        if ext not in self.parsers:
-            return [f"Unsupported file extension: {ext}"]
+        handler = self.registry.get_handler(file_path)
+        if not handler or not handler.parser:
+            return [] # Cannot validate without parser
             
-        parser = self.parsers[ext]
-        tree = parser.parse(bytes(code, "utf8"))
+        tree = handler.parser.parse(bytes(code, "utf8"))
         
         errors = []
         # Traverse tree to find ERROR or MISSING nodes
@@ -516,78 +333,47 @@ class CodeIndexer:
         Finds function/method calls in the code that might be undefined.
         Returns a set of called function names.
         """
-        ext = os.path.splitext(file_path)[1]
-        if ext not in self.parsers:
+        handler = self.registry.get_handler(file_path)
+        if not handler or not handler.parser:
             return set()
         
-        parser = self.parsers[ext]
-        tree = parser.parse(bytes(code, "utf8"))
+        tree = handler.parser.parse(bytes(code, "utf8"))
         
-        called_functions = set()
+        # Use handler's extract_references to find calls
+        # We pass dummy IDs since we only care about names
+        references = handler.extract_references(tree, code, file_path, "dummy", {})
         
-        # Traverse tree to find function calls
-        cursor = tree.walk()
-        visited_children = False
-        
-        while True:
-            if not visited_children:
-                node = cursor.node
-                
-                # Python call
-                if node.type == "call":
-                    func_node = node.child_by_field_name("function")
-                    if func_node and func_node.type == "identifier":
-                        func_name = code[func_node.start_byte:func_node.end_byte]
-                        called_functions.add(func_name)
-                
-                # JavaScript/TypeScript call_expression  
-                elif node.type == "call_expression":
-                    func_node = node.child_by_field_name("function")
-                    if func_node and func_node.type == "identifier":
-                        func_name = code[func_node.start_byte:func_node.end_byte]
-                        called_functions.add(func_name)
-                
-                # Java method_invocation
-                elif node.type == "method_invocation":
-                    name_node = node.child_by_field_name("name")
-                    if name_node:
-                        func_name = code[name_node.start_byte:name_node.end_byte]
-                        called_functions.add(func_name)
-            
-            if not visited_children and cursor.goto_first_child():
-                visited_children = False
-            elif cursor.goto_next_sibling():
-                visited_children = False
-            elif cursor.goto_parent():
-                visited_children = True
-            else:
-                break
-        
-        return called_functions
+        return {ref.name for ref in references}
 
-    def extract_definitions_from_text(self, code: str, file_path: str) -> List[str]:
+    def extract_definitions_from_text(self, code: str, file_path: str) -> Dict[str, str]:
         """
-        Parses code and returns a list of defined symbol names (functions/classes).
+        Parses code and returns a dict of defined symbol names to their signatures.
         Used for impact analysis.
         """
-        ext = os.path.splitext(file_path)[1]
-        if ext not in self.parsers:
-            return []
+        handler = self.registry.get_handler(file_path)
+        if not handler or not handler.parser:
+            return {}
             
-        parser = self.parsers[ext]
-        tree = parser.parse(bytes(code, "utf8"))
+        tree = handler.parser.parse(bytes(code, "utf8"))
         
-        definitions = []
+        # Use handler's extract_definitions
+        definitions = handler.extract_definitions(tree, code, file_path, "dummy")
         
-        def _visit(node):
-            if node.type in ["function_definition", "class_definition", "function_declaration", "class_declaration", "method_definition"]:
-                name_node = node.child_by_field_name("name")
-                if name_node:
-                    name = code[name_node.start_byte:name_node.end_byte]
-                    definitions.append(name)
-            for child in node.children:
-                _visit(child)
-                
-        _visit(tree.root_node)
-        return definitions
+        # Map name -> code (signature approximation)
+        return {d.name: d.code for d in definitions}
 
+    def extract_imports(self, code: str, file_path: str) -> Set[str]:
+        """
+        Parses code and returns a set of imported symbol names.
+        """
+        handler = self.registry.get_handler(file_path)
+        if not handler:
+            return set()
+            
+        # Use handler's extract_imports
+        tree = None
+        if handler.parser:
+            tree = handler.parser.parse(bytes(code, "utf8"))
+            
+        imports = handler.extract_imports(tree, code, file_path)
+        return {imp.symbol for imp in imports}

@@ -1,6 +1,6 @@
 [project]
 name = "kgraph"
-version = "0.3.1"
+version = "0.4.0"
 description = "A high-performance Knowledge Graph MCP server for code analysis"
 readme = "README.md"
 license = { file = "LICENSE" }

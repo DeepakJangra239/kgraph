@@ -1,0 +1,57 @@
+# Rust Language Configuration
+# Tree-sitter queries for code extraction
+
+language: rust
+extensions:
+  - .rs
+
+parser: tree_sitter_rust
+
+queries:
+  imports: |
+    (use_declaration
+      argument: (_) @import)
+  
+  definitions: |
+    [
+      (function_item
+        name: (identifier) @func.name) @func.def
+      (struct_item
+        name: (type_identifier) @struct.name) @struct.def
+      (enum_item
+        name: (type_identifier) @enum.name) @enum.def
+      (impl_item
+        type: (_) @impl.type) @impl.def
+    ]
+  
+  calls: |
+    (call_expression
+      function: (identifier) @call.name)
+
+extraction:
+  imports:
+    full_import_capture: import
+    split_on: "::"
+    symbol_index: -1
+    
+  definitions:
+    function:
+      name_capture: func.name
+      node_capture: func.def
+      kind: FUNCTION
+    struct:
+      name_capture: struct.name
+      node_capture: struct.def
+      kind: STRUCT
+    enum:
+      name_capture: enum.name
+      node_capture: enum.def
+      kind: ENUM
+    impl:
+      name_capture: impl.type
+      node_capture: impl.def
+      kind: IMPL
+      
+  calls:
+    name_capture: call.name
+    kind: CALL

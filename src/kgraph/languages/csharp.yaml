@@ -1,0 +1,51 @@
+# C# Language Configuration
+# Tree-sitter queries for code extraction
+
+language: csharp
+extensions:
+  - .cs
+
+parser: tree_sitter_c_sharp
+
+queries:
+  imports: |
+    (using_directive
+      (_) @import)
+  
+  definitions: |
+    [
+      (method_declaration
+        name: (identifier) @method.name) @method.def
+      (class_declaration
+        name: (identifier) @class.name) @class.def
+      (interface_declaration
+        name: (identifier) @interface.name) @interface.def
+    ]
+  
+  calls: |
+    (invocation_expression
+      function: (identifier) @call.name)
+
+extraction:
+  imports:
+    full_import_capture: import
+    split_on: "."
+    symbol_index: -1
+    
+  definitions:
+    method:
+      name_capture: method.name
+      node_capture: method.def
+      kind: METHOD
+    class:
+      name_capture: class.name
+      node_capture: class.def
+      kind: CLASS
+    interface:
+      name_capture: interface.name
+      node_capture: interface.def
+      kind: INTERFACE
+      
+  calls:
+    name_capture: call.name
+    kind: CALL

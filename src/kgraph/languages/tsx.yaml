@@ -1,0 +1,154 @@
+# TypeScript/JavaScript Language Configuration
+# Includes code (tree-sitter) and config files (package.json)
+
+language: tsx
+
+code:
+  extensions:
+    - .tsx
+  parser: tree_sitter_typescript
+  parser_factory: language_tsx
+  queries:
+    imports: |
+      (import_statement
+        (import_clause
+          (named_imports
+            (import_specifier
+              name: (identifier) @symbol)))
+        source: (string) @source)
+      
+      (import_statement
+        (import_clause
+          (identifier) @symbol)
+        source: (string) @source)
+    
+    definitions: |
+      [
+        ; React Components (PascalCase functions)
+        (function_declaration
+          name: (identifier) @component.name
+          (#match? @component.name "^[A-Z]")
+        ) @component.def
+
+        (variable_declarator
+          name: (identifier) @component.name
+          value: [(arrow_function) (function_expression)]
+          (#match? @component.name "^[A-Z]")
+        ) @component.def
+
+        ; React Hooks
+        (call_expression
+          function: (identifier) @hook.name
+          (#match? @hook.name "^use")
+        ) @hook.def
+
+        ; JSX Event Handlers
+        (jsx_attribute
+          (property_identifier) @handler.name
+          (#match? @handler.name "^on")
+        ) @handler.def
+
+        (function_declaration
+          name: (identifier) @func.name) @func.def
+        (class_declaration
+          name: (type_identifier) @class.name) @class.def
+        (method_definition
+          name: (property_identifier) @method.name) @method.def
+        (variable_declarator
+          name: (identifier) @func.name
+          value: [(arrow_function) (function_expression)]) @func.def
+      ]
+    
+    calls: |
+      [
+        (call_expression
+          function: (identifier) @call.name)
+        (call_expression
+          function: (member_expression
+            property: (property_identifier) @call.name))
+        (new_expression
+          constructor: (_) @instantiation.name)
+      ]
+    
+    jsx_components: |
+      [
+        (jsx_self_closing_element
+          name: (identifier) @jsx.component)
+        (jsx_element
+          open_tag: (jsx_opening_element
+            name: (identifier) @jsx.component))
+      ]
+
+  extraction:
+    imports:
+      symbol_capture: symbol
+      source_capture: source
+      requires_source: true
+      strip_quotes: true
+      
+    definitions:
+      component:
+        name_capture: component.name
+        node_capture: component.def
+        kind: COMPONENT
+      hook:
+        name_capture: hook.name
+        node_capture: hook.def
+        kind: HOOK
+      handler:
+        name_capture: handler.name
+        node_capture: handler.def
+        kind: EVENT_HANDLER
+      function:
+        name_capture: func.name
+        node_capture: func.def
+        kind: FUNCTION
+      class:
+        name_capture: class.name
+        node_capture: class.def
+        kind: CLASS
+      method:
+        name_capture: method.name
+        node_capture: method.def
+        kind: FUNCTION
+        
+    calls:
+      function:
+        name_capture: call.name
+        kind: CALL
+      instantiation:
+        name_capture: instantiation.name
+        kind: INSTANTIATION
+        split_on: "."
+        symbol_index: -1
+      jsx:
+        name_capture: jsx.component
+        kind: JSX_COMPONENT
+        filter_uppercase: true
+
+configs:
+  - name: package_json
+    files:
+      - package.json
+    parser: json
+    extraction:
+      dependencies:
+        path: dependencies
+        extract: keys
+        kind: NPM_DEPENDENCY
+      devDependencies:
+        path: devDependencies
+        extract: keys
+        kind: NPM_DEV_DEPENDENCY
+      scripts:
+        path: scripts
+        extract: keys
+        kind: NPM_SCRIPT
+      name:
+        path: name
+        extract: value
+        kind: PROJECT_NAME
+      version:
+        path: version
+        extract: value
+        kind: PROJECT_VERSION

@@ -1,0 +1,98 @@
+# Generic Project Configuration
+# Handles generic files like Dockerfile, .env, docker-compose.yml
+
+language: project
+
+configs:
+  - name: dockerfile
+    files:
+      - Dockerfile
+      - .dockerfile
+    parser: text_patterns
+    patterns:
+      base_image:
+        regex: '^FROM\s+(\S+)'
+        capture_group: 1
+        kind: DOCKER_BASE_IMAGE
+      environment_vars:
+        regex: '^ENV\s+(\w+)'
+        capture_group: 1
+        kind: DOCKER_ENV_VAR
+      exposed_ports:
+        regex: '^EXPOSE\s+(\d+)'
+        capture_group: 1
+        kind: DOCKER_PORT
+      run_commands:
+        regex: '^RUN\s+(.+)$'
+        capture_group: 1
+        kind: DOCKER_RUN_CMD
+        parse_packages: true
+      copy_files:
+        regex: '^COPY\s+(\S+)\s+(\S+)'
+        capture_groups: [1, 2]
+        kind: DOCKER_COPY
+      working_dir:
+        regex: '^WORKDIR\s+(\S+)'
+        capture_group: 1
+        kind: DOCKER_WORKDIR
+
+  - name: env_file
+    files:
+      - .env
+      - .env.example
+      - .env.local
+      - .env.development
+      - .env.production
+    parser: text_patterns
+    patterns:
+      environment_variables:
+        regex: '^([A-Z_][A-Z0-9_]*)\s*='
+        capture_group: 1
+        kind: ENV_VAR
+        ignore_comments: true
+      secret_patterns:
+        regex: '^([A-Z_]*(?:PASSWORD|SECRET|KEY|TOKEN|API)[A-Z0-9_]*)\s*='
+        capture_group: 1
+        kind: ENV_SECRET
+        flag_sensitive: true
+
+  - name: yaml_config
+    files:
+      - .yml
+      - .yaml
+      - application.yml
+      - application.yaml
+      - docker-compose.yml
+      - docker-compose.yaml
+    parser: yaml
+    extraction:
+      spring_properties:
+        path_pattern: spring.*
+        kind: SPRING_PROPERTY
+      database_config:
+        paths:
+          - datasource.url
+          - database.url
+          - db.host
+        kind: DB_CONFIG
+      docker_services:
+        path: services
+        extract: keys
+        kind: DOCKER_SERVICE
+      docker_images:
+        path: services.*.image
+        kind: DOCKER_IMAGE
+      ci_jobs:
+        path: jobs
+        extract: keys
+        kind: CI_JOB
+      ci_steps:
+        path: jobs.*.steps.*.uses
+        kind: CI_ACTION
+      k8s_kind:
+        path: kind
+        extract: value
+        kind: K8S_RESOURCE_TYPE
+      k8s_containers:
+        path: spec.containers.*.image
+        kind: K8S_CONTAINER_IMAGE

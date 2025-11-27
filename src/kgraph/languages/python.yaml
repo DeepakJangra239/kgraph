@@ -1,0 +1,77 @@
+# Python Language Configuration
+# Includes code (tree-sitter) and config files (requirements.txt, pyproject.toml)
+
+language: python
+
+code:
+  extensions:
+    - .py
+  parser: tree_sitter_python
+  queries:
+    imports: |
+      (import_from_statement
+        module_name: (dotted_name) @module
+        (dotted_name) @symbol)
+      (import_statement
+        name: (dotted_name) @module)
+    
+    definitions: |
+      [
+        (function_definition
+          name: (identifier) @func.name) @func.def
+        (class_definition
+          name: (identifier) @class.name) @class.def
+      ]
+    
+    calls: |
+      [
+        (call
+          function: (identifier) @call.name)
+        (call
+          function: (attribute
+            attribute: (identifier) @call.name))
+      ]
+
+  extraction:
+    imports:
+      symbol_capture: symbol
+      module_capture: module
+      
+    definitions:
+      function:
+        name_capture: func.name
+        node_capture: func.def
+        kind: FUNCTION
+      class:
+        name_capture: class.name
+        node_capture: class.def
+        kind: CLASS
+        
+    calls:
+      name_capture: call.name
+      kind: CALL
+
+configs:
+  - name: pip_requirements
+    files:
+      - requirements.txt
+      - requirements-dev.txt
+    parser: text_patterns
+    patterns:
+      dependencies:
+        regex: '^([a-zA-Z0-9_-]+)(?:[>=<].*)?$'
+        capture_group: 1
+        kind: PIP_DEPENDENCY
+        ignore_comments: true
+
+  - name: pyproject_toml
+    files:
+      - pyproject.toml
+    parser: toml
+    extraction:
+      dependencies:
+        path: project.dependencies
+        kind: PIP_DEPENDENCY
+      dev_dependencies:
+        path: project.optional-dependencies.dev
+        kind: PIP_DEV_DEPENDENCY
