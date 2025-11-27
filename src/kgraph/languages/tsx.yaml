@@ -1,13 +1,13 @@
-# JavaScript Language Configuration
+# TypeScript/JavaScript Language Configuration
 # Includes code (tree-sitter) and config files (package.json)
 
-language: javascript
+language: tsx
 
 code:
   extensions:
-    - .js
-    - .jsx
-  parser: tree_sitter_javascript
+    - .tsx
+  parser: tree_sitter_typescript
+  parser_factory: language_tsx
   queries:
     imports: |
       (import_statement
