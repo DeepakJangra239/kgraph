@@ -37,12 +37,20 @@ class CodeIndexer:
             JS_LANGUAGE = Language(tree_sitter_javascript.language())
             JAVA_LANGUAGE = Language(tree_sitter_java.language())
             
+            import tree_sitter_go
+            GO_LANGUAGE = Language(tree_sitter_go.language())
+            
+            import tree_sitter_typescript
+            TS_LANGUAGE = Language(tree_sitter_typescript.language_typescript())
+            TSX_LANGUAGE = Language(tree_sitter_typescript.language_tsx())
+            
             self.parsers[".py"] = Parser(PY_LANGUAGE)
             self.parsers[".js"] = Parser(JS_LANGUAGE)
             self.parsers[".jsx"] = Parser(JS_LANGUAGE)
-            self.parsers[".ts"] = Parser(JS_LANGUAGE) # Basic TS support via JS parser
-            self.parsers[".tsx"] = Parser(JS_LANGUAGE)
+            self.parsers[".ts"] = Parser(TS_LANGUAGE)
+            self.parsers[".tsx"] = Parser(TSX_LANGUAGE)
             self.parsers[".java"] = Parser(JAVA_LANGUAGE)
+            self.parsers[".go"] = Parser(GO_LANGUAGE)
         except Exception as e:
             logger.error(f"Error initializing parsers: {e}")
 
@@ -236,6 +244,26 @@ class CodeIndexer:
         nodes = []
         edges = []
         
+        # Imports (Python, JS, Java)
+        if node.type in ["import_statement", "import_from_statement", "import_declaration"]:
+            import_text = code[node.start_byte:node.end_byte]
+            node_id = f"IMPORT:{file_path}:{node.start_point[0]}"
+            
+            nodes.append({
+                "node_id": node_id,
+                "node_type": "IMPORT",
+                "name": import_text.split('\n')[0],
+                "file_path": file_path,
+                "start_line": node.start_point[0] + 1,
+                "end_line": node.end_point[0] + 1,
+                "code_content": import_text
+            })
+            edges.append({
+                "source_id": parent_id,
+                "target_id": node_id,
+                "edge_type": "IMPORTS"
+            })
+
         # Python definitions
         if node.type in ["function_definition", "class_definition"]:
             name_node = node.child_by_field_name("name")
@@ -329,53 +357,109 @@ class CodeIndexer:
     def _extract_references_data(self, node, source_id: str, file_path: str, code: str) -> List[Dict]:
         edges = []
         
-        # Python Call
+        # Python Call (includes both function calls and class instantiation)
         if node.type == "call":
             func_node = node.child_by_field_name("function")
             if func_node:
-                call_name = code[func_node.start_byte:func_node.end_byte]
-                if "." in call_name:
-                    call_name = call_name.split(".")[-1]
+                call_text = code[func_node.start_byte:func_node.end_byte]
                 
-                # Optimistic linking: We can't query the store here easily if it's not thread-safe or if we want to avoid DB hits in workers.
-                # But we need to know the target ID. 
-                # Strategy: Store the "call_name" in the edge property or a temporary "UNRESOLVED" edge, 
-                # and resolve it later? Or just query the store?
-                # The store is SQLite. Reading is fine if we use a separate connection or if `store` is thread-safe.
-                # `GraphStore` uses one connection `self.conn`. Sharing it across threads is risky with `sqlite3` unless `check_same_thread=False`.
-                # Let's assume for now we just skip the DB lookup in the worker and do it in the main thread?
-                # No, that would block the main thread.
-                # Better: Allow `GraphStore` to be used from threads (add lock or new cursor).
-                # Actually, `sqlite3` allows sharing connection if we serialize access or use read-only.
-                # BUT `find_nodes_by_name` is a read.
-                # Let's try to access `self.store` from threads. We might need to make `GraphStore` thread-safe.
+                # Extract all potential target names
+                # For obj.method() -> extract "method"
+                # For ClassName() -> extract "ClassName"
+                # For module.Class() -> extract "Class"
+                call_names = set()
                 
-                # For now, let's just return the "intent" to link, and let the main thread resolve it?
-                # That's too much work for main thread.
-                # Let's make `GraphStore` thread-safe for reads.
+                if "." in call_text:
+                    # Handle obj.method() or module.Class()
+                    parts = call_text.split(".")
+                    call_names.add(parts[-1])  # Last part (method/class name)
+                    if len(parts) == 2:
+                        call_names.add(parts[0])  # First part might be class name
+                else:
+                    call_names.add(call_text)
                 
-                potential_targets = self.store.find_nodes_by_name(call_name)
-                for target in potential_targets:
-                    edges.append({
-                        "source_id": source_id,
-                        "target_id": target['id'],
-                        "edge_type": "CALLS"
-                    })
+                for call_name in call_names:
+                    if call_name and not call_name.startswith("_"):  # Skip special methods
+                        potential_targets = self.store.find_nodes_by_name(call_name)
+                        for target in potential_targets:
+                            edges.append({
+                                "source_id": source_id,
+                                "target_id": target['id'],
+                                "edge_type": "CALLS"
+                            })
 
+        # JavaScript/TypeScript Call (call_expression and new_expression)
+        if node.type in ["call_expression", "new_expression"]:
+            # Handle both regular calls and 'new ClassName()'
+            if node.type == "new_expression":
+                # new ClassName()
+                class_node = node.child_by_field_name("constructor")
+                if class_node:
+                    class_name = code[class_node.start_byte:class_node.end_byte]
+                    if "." in class_name:
+                        class_name = class_name.split(".")[-1]
+                    
+                    potential_targets = self.store.find_nodes_by_name(class_name)
+                    for target in potential_targets:
+                        edges.append({
+                            "source_id": source_id,
+                            "target_id": target['id'],
+                            "edge_type": "CALLS"
+                        })
+            else:
+                # Regular function call
+                func_node = node.child_by_field_name("function")
+                if func_node:
+                    call_text = code[func_node.start_byte:func_node.end_byte]
+                    call_names = set()
+                    
+                    if "." in call_text:
+                        parts = call_text.split(".")
+                        call_names.add(parts[-1])
+                    else:
+                        call_names.add(call_text)
+                    
+                    for call_name in call_names:
+                        if call_name:
+                            potential_targets = self.store.find_nodes_by_name(call_name)
+                            for target in potential_targets:
+                                edges.append({
+                                    "source_id": source_id,
+                                    "target_id": target['id'],
+                                    "edge_type": "CALLS"
+                                })
 
-        # Java Call
-        if node.type == "method_invocation":
-            name_node = node.child_by_field_name("name")
-            if name_node:
-                call_name = code[name_node.start_byte:name_node.end_byte]
-                
-                potential_targets = self.store.find_nodes_by_name(call_name)
-                for target in potential_targets:
-                    edges.append({
-                        "source_id": source_id,
-                        "target_id": target['id'],
-                        "edge_type": "CALLS"
-                    })
+        # Java Call (method_invocation and object_creation_expression)
+        if node.type in ["method_invocation", "object_creation_expression"]:
+            if node.type == "object_creation_expression":
+                # new ClassName()
+                type_node = node.child_by_field_name("type")
+                if type_node:
+                    class_name = code[type_node.start_byte:type_node.end_byte]
+                    # Remove generic types: ClassName<T> -> ClassName
+                    if "<" in class_name:
+                        class_name = class_name.split("<")[0]
+                    
+                    potential_targets = self.store.find_nodes_by_name(class_name)
+                    for target in potential_targets:
+                        edges.append({
+                            "source_id": source_id,
+                            "target_id": target['id'],
+                            "edge_type": "CALLS"
+                        })
+            else:
+                # Regular method call
+                name_node = node.child_by_field_name("name")
+                if name_node:
+                    call_name = code[name_node.start_byte:name_node.end_byte]
+                    
+                    potential_targets = self.store.find_nodes_by_name(call_name)
+                    for target in potential_targets:
+                        edges.append({
+                            "source_id": source_id,
+                            "target_id": target['id'],
+                            "edge_type": "CALLS"
+                        })
         new_source_id = source_id
         if node.type in ["function_definition", "class_definition", "function_declaration", "method_definition", "class_declaration", "interface_declaration", "enum_declaration", "method_declaration", "constructor_declaration"]:
              name_node = node.child_by_field_name("name")
@@ -424,8 +508,62 @@ class CodeIndexer:
                 visited_children = True
             else:
                 break
-                
+        
         return errors
+
+    def find_undefined_calls(self, code: str, file_path: str) -> set:
+        """
+        Finds function/method calls in the code that might be undefined.
+        Returns a set of called function names.
+        """
+        ext = os.path.splitext(file_path)[1]
+        if ext not in self.parsers:
+            return set()
+        
+        parser = self.parsers[ext]
+        tree = parser.parse(bytes(code, "utf8"))
+        
+        called_functions = set()
+        
+        # Traverse tree to find function calls
+        cursor = tree.walk()
+        visited_children = False
+        
+        while True:
+            if not visited_children:
+                node = cursor.node
+                
+                # Python call
+                if node.type == "call":
+                    func_node = node.child_by_field_name("function")
+                    if func_node and func_node.type == "identifier":
+                        func_name = code[func_node.start_byte:func_node.end_byte]
+                        called_functions.add(func_name)
+                
+                # JavaScript/TypeScript call_expression  
+                elif node.type == "call_expression":
+                    func_node = node.child_by_field_name("function")
+                    if func_node and func_node.type == "identifier":
+                        func_name = code[func_node.start_byte:func_node.end_byte]
+                        called_functions.add(func_name)
+                
+                # Java method_invocation
+                elif node.type == "method_invocation":
+                    name_node = node.child_by_field_name("name")
+                    if name_node:
+                        func_name = code[name_node.start_byte:name_node.end_byte]
+                        called_functions.add(func_name)
+            
+            if not visited_children and cursor.goto_first_child():
+                visited_children = False
+            elif cursor.goto_next_sibling():
+                visited_children = False
+            elif cursor.goto_parent():
+                visited_children = True
+            else:
+                break
+        
+        return called_functions
 
     def extract_definitions_from_text(self, code: str, file_path: str) -> List[str]:
         """

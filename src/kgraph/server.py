@@ -69,10 +69,15 @@ def reindex_codebase(root_path: str) -> str:
         return f"Error indexing codebase: {str(e)}"
 
 @mcp.tool()
-def search_code(query: str, limit: int = 5) -> str:
+def search_code(query: str, limit: int = 5, file_type: str = None) -> str:
     """
     Performs a semantic search for code snippets relevant to the query.
     Note: Requires a project to be indexed first with reindex_codebase.
+    
+    Parameters:
+    - query: Search query
+    - limit: Maximum results (default 5)
+    - file_type: Optional file extension filter (e.g., "py", "java", "ts")
     """
     if store is None:
         return "Error: No project indexed yet. Please run reindex_codebase first."
@@ -89,6 +94,7 @@ def search_code(query: str, limit: int = 5) -> str:
     for res in keyword_results:
         if res['id'] not in seen_ids:
             res['search_method'] = 'keyword'
+            res['confidence'] = 1.0  # Exact match = 100% confidence
             final_results.append(res)
             seen_ids.add(res['id'])
             
@@ -96,8 +102,24 @@ def search_code(query: str, limit: int = 5) -> str:
     for res in semantic_results:
         if res['id'] not in seen_ids:
             res['search_method'] = 'semantic'
+            # Convert distance to confidence (0-1 scale)
+            # Lower distance = higher confidence
+            # Typical distance range is 0-2, so we use 1 / (1 + distance)
+            distance = res.get('_distance', 1.0)
+            res['confidence'] = round(1.0 / (1.0 + distance), 2)
             final_results.append(res)
             seen_ids.add(res['id'])
+    
+    # Apply file type filter if specified
+    if file_type:
+        # Normalize file_type (remove leading dot if present)
+        if not file_type.startswith('.'):
+            file_type = '.' + file_type
+        
+        final_results = [
+            r for r in final_results 
+            if r.get('file_path', '').endswith(file_type)
+        ]
             
     return json.dumps(final_results, indent=2)
 
@@ -117,19 +139,43 @@ def get_structure(file_path: str) -> str:
     # Since IDs are deterministic (file:path), we can construct it.
     
     file_id = f"file:{file_path}"
-    related = store.get_related(file_id, edge_type="DEFINES", direction="out")
     
-    if not related:
+    # Fetch Imports
+    imports = store.get_related(file_id, edge_type="IMPORTS", direction="out")
+    
+    # Fetch Definitions (Classes, Functions)
+    definitions = store.get_related(file_id, edge_type="DEFINES", direction="out")
+    
+    if not imports and not definitions:
         return f"No structure found for {file_path}. Is it indexed?"
     
-    structure = []
-    for node in related:
-        structure.append({
+    structure = {
+        "imports": [imp['name'] for imp in imports],
+        "definitions": []
+    }
+    
+    for node in definitions:
+        item = {
             "type": node['type'],
             "name": node['name'],
-            "line": node['start_line']
-        })
-    
+            "line": node['start_line'],
+            "doc": node.get('properties', {}).get('docstring', '')
+        }
+        
+        # If Class, fetch nested methods
+        if node['type'] == 'CLASS':
+            methods = store.get_related(node['id'], edge_type="DEFINES", direction="out")
+            if methods:
+                item['methods'] = []
+                for m in methods:
+                    item['methods'].append({
+                        "name": m['name'],
+                        "line": m['start_line'],
+                        "doc": m.get('properties', {}).get('docstring', '')
+                    })
+        
+        structure["definitions"].append(item)
+        
     return json.dumps(structure, indent=2)
 
 @mcp.tool()
@@ -167,20 +213,32 @@ def find_references(name: str) -> str:
         return f"No definitions found for '{name}'. Cannot find references."
     
     references = []
+    seen_refs = set()  # Track unique references
+    
     for target in target_nodes:
         target_id = target['id']
         # 2. Find incoming CALLS edges
-        # We want to know who calls this target
         callers = store.get_related(target_id, edge_type="CALLS", direction="in")
         
         for caller in callers:
-            references.append({
-                "source_file": caller['file_path'],
-                "source_line": caller['start_line'],
-                "caller_name": caller['name'],
-                "target_file": target['file_path'],
-                "target_type": target['type']
-            })
+            # Use a comprehensive key to avoid any duplicates
+            ref_key = (
+                caller['file_path'], 
+                caller['start_line'], 
+                caller['name'],
+                target['file_path'],
+                target['name']
+            )
+            if ref_key not in seen_refs:
+                seen_refs.add(ref_key)
+                references.append({
+                    "source_file": caller['file_path'],
+                    "source_line": caller['start_line'],
+                    "caller_name": caller['name'],
+                    "target_file": target['file_path'],
+                    "target_name": target['name'],
+                    "target_type": target['type']
+                })
             
     if not references:
         return f"No references found for '{name}'."
@@ -265,37 +323,55 @@ def validate_edit(file_path: str, new_content: str) -> str:
     Use this tool to check your code before writing it to a file.
     """
     file_path = os.path.abspath(file_path)
+    
     # 1. Syntax Check
     syntax_errors = indexer.validate_syntax(new_content, file_path)
     if syntax_errors:
         return "❌ SYNTAX ERRORS DETECTED:\n" + "\n".join(syntax_errors)
     
     # 2. Impact Analysis (Breaking Changes)
-    # Get current definitions in the graph for this file (recursive, all nodes in file)
     current_defs = store.get_nodes_by_file(file_path)
-    # Filter out the file node itself
     current_defs = [n for n in current_defs if n['type'] != 'FILE']
     current_def_names = {node['name']: node['id'] for node in current_defs}
     
-    # Get new definitions from proposed content
     new_def_names = set(indexer.extract_definitions_from_text(new_content, file_path))
-    
-    # Find removed definitions
     removed_names = set(current_def_names.keys()) - new_def_names
     
     breaking_changes = []
     for name in removed_names:
         node_id = current_def_names[name]
-        # Check if this node is used by others
         refs = store.get_related(node_id, edge_type="CALLS", direction="in")
         if refs:
             ref_list = [f"{r['name']} in {r['file_path']}" for r in refs]
             breaking_changes.append(f"⚠️ BREAKING CHANGE: You are removing '{name}' which is used by:\n   - " + "\n   - ".join(ref_list))
-            
+    
+    # 3. Runtime Validation Warnings (Undefined symbols)
+    warnings = []
+    undefined_calls = indexer.find_undefined_calls(new_content, file_path)
+    
+    if undefined_calls:
+        for call_name in undefined_calls:
+            # Check if it exists anywhere in the codebase
+            definitions = store.find_nodes_by_name(call_name)
+            if not definitions:
+                warnings.append(f"⚠️ WARNING: Function '{call_name}' is called but not found in the indexed codebase. Verify:")
+                warnings.append(f"   - Is it imported from an external library?")
+                warnings.append(f"   - Is it defined elsewhere?")
+                warnings.append(f"   - Is the spelling correct?")
+    
+    # Build response
+    response = "✅ Syntax is Valid.\n"
+    
     if breaking_changes:
-        return "✅ Syntax is Valid.\n\n" + "\n".join(breaking_changes)
+        response += "\n" + "\n".join(breaking_changes)
+    
+    if warnings:
+        response += "\n\n" + "\n".join(warnings)
+    
+    if not breaking_changes and not warnings:
+        response += "\n✅ No breaking changes or warnings detected."
         
-    return "✅ Edit looks safe. Syntax is valid and no breaking changes detected."
+    return response
 
 # Run the server
 if __name__ == "__main__":

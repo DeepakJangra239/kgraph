@@ -1,6 +1,6 @@
 [project]
 name = "kgraph"
-version = "0.1.3"
+version = "0.3.1"
 description = "A high-performance Knowledge Graph MCP server for code analysis"
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -11,7 +11,10 @@ dependencies = [
     "tree-sitter-python",
     "tree-sitter-javascript",
     "tree-sitter-java",
+    "tree-sitter-go",
+    "tree-sitter-typescript",
     "lancedb",
+    "lance-namespace==0.0.21",
     "sentence-transformers",
     "numpy",
 ]
