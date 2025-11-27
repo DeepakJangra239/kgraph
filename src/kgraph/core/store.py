@@ -75,8 +75,10 @@ class GraphStore:
         # Define schema implicitly by creating table with first item or checking existence
         try:
             self.table = self.lance_db.open_table("code_vectors")
-        except:
+            logger.info(f"Opened existing LanceDB table at {self.lancedb_path}")
+        except Exception as e:
             # Table will be created on first insertion
+            logger.info(f"LanceDB table not found, will be created on first indexing")
             self.table = None
 
     def add_node(self, node_id: str, node_type: str, name: str, file_path: str, 
@@ -185,16 +187,26 @@ class GraphStore:
 
     def search_nodes(self, query: str, limit: int = 5) -> List[Dict[str, Any]]:
         if self.table is None:
-            return []
+            # Try to open table again in case it was created after initialization
+            try:
+                self.table = self.lance_db.open_table("code_vectors")
+                logger.info("Successfully opened LanceDB table")
+            except Exception as e:
+                logger.error(f"LanceDB table 'code_vectors' not found at {self.lancedb_path}. Please reindex the codebase first.")
+                raise ValueError(f"Vector database not initialized. Please run reindex_codebase first. Error: {e}")
         
-        if self.use_mlx:
-            output = self.mlx_generate(self.mlx_model, self.mlx_tokenizer, [query])
-            query_vector = output.last_hidden_state[:, 0, :][0].tolist()
-        else:
-            query_vector = self.encoder.encode(query).tolist()
-            
-        results = self.table.search(query_vector).limit(limit).to_list()
-        return results
+        try:
+            if self.use_mlx:
+                output = self.mlx_generate(self.mlx_model, self.mlx_tokenizer, [query])
+                query_vector = output.last_hidden_state[:, 0, :][0].tolist()
+            else:
+                query_vector = self.encoder.encode(query).tolist()
+                
+            results = self.table.search(query_vector).limit(limit).to_list()
+            return results
+        except Exception as e:
+            logger.error(f"Error searching LanceDB: {e}")
+            raise ValueError(f"Search failed: {e}. The vector database may be corrupted. Try reindexing.")
 
     def get_node(self, node_id: str) -> Optional[Dict[str, Any]]:
         conn = self._get_conn()
@@ -228,11 +240,16 @@ class GraphStore:
         for row in cursor.fetchall():
             d = dict(row)
             d['properties'] = json.loads(d['properties']) if d['properties'] else {}
+            
+            # Skip UNKNOWN targets - they haven't been resolved yet
+            if d['id'].startswith('UNKNOWN:'):
+                continue
+                
             # Fetch full node details for the related node
             node_details = self.get_node(d['id'])
             if node_details:
                 d.update(node_details)
-            results.append(d)
+                results.append(d)
         return results
 
     def find_nodes_by_name(self, name: str) -> List[Dict[str, Any]]:

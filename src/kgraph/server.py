@@ -20,6 +20,9 @@ def get_or_create_store_for_path(root_path: str) -> tuple[GraphStore, CodeIndexe
     """Get or create a GraphStore and CodeIndexer for a specific project path."""
     global store, indexer
     
+    # Resolve symlinks to get canonical path
+    root_path = os.path.realpath(root_path)
+    
     # Create .kgraph directory inside the project
     kgraph_dir = os.path.join(root_path, ".kgraph")
     os.makedirs(kgraph_dir, exist_ok=True)

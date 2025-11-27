@@ -98,9 +98,14 @@ class CodeIndexer:
                     batch_edges.extend(edges)
                     
                     if len(batch_nodes) >= BATCH_SIZE:
-                        self.store.add_nodes_batch(batch_nodes)
-                        for edge in batch_edges:
-                            self.store.add_edge(**edge)
+                        try:
+                            self.store.add_nodes_batch(batch_nodes)
+                            for edge in batch_edges:
+                                self.store.add_edge(**edge)
+                        except Exception as e:
+                            logger.error(f"Error adding batch to database: {e}")
+                            import traceback
+                            traceback.print_exc()
                         batch_nodes = []
                         batch_edges = []
                     
@@ -109,12 +114,19 @@ class CodeIndexer:
                     continue
                 except Exception as e:
                     logger.error(f"Error in worker: {e}")
+                    import traceback
+                    traceback.print_exc()
             
             # Flush remaining
             if batch_nodes or batch_edges:
-                self.store.add_nodes_batch(batch_nodes)
-                for edge in batch_edges:
-                    self.store.add_edge(**edge)
+                try:
+                    self.store.add_nodes_batch(batch_nodes)
+                    for edge in batch_edges:
+                        self.store.add_edge(**edge)
+                except Exception as e:
+                    logger.error(f"Error flushing final batch: {e}")
+                    import traceback
+                    traceback.print_exc()
 
         # Start consumer thread
         consumer_thread = threading.Thread(target=worker, daemon=True)
