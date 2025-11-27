@@ -13,13 +13,52 @@ A high-performance, lightweight Knowledge Graph MCP server for code analysis, op
 
 ## Installation
 
-```bash
-# Run directly with uv
-uvx --from . kgraph
+### For Development (Local Testing)
 
-# Or install via pip
-pip install .
+When developing kgraph locally, use the dev wrapper script to avoid cache issues:
+
+```bash
+# Make the script executable (one time)
+chmod +x dev-server.sh
+
+# Run the server
+./dev-server.sh
+```
+
+**MCP Client Configuration (Development)**:
+```json
+{
+  "mcpServers": {
+    "kgraph": {
+      "command": "/absolute/path/to/kgraph/dev-server.sh"
+    }
+  }
+}
+```
+
+> **Note**: The `dev-server.sh` script uses `uv run` to bypass uvx caching issues during development. It always uses the latest source code.
+
+### For Production (Published Package)
+
+```bash
+# Install from local directory
+uvx --from /path/to/kgraph kgraph
+
+# Or install via pip (when published to PyPI)
+pip install kgraph
 kgraph
+```
+
+**MCP Client Configuration (Production)**:
+```json
+{
+  "mcpServers": {
+    "kgraph": {
+      "command": "uvx",
+      "args": ["kgraph"]
+    }
+  }
+}
 ```
 
 ## MCP Client Configuration

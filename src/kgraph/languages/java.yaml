@@ -1,0 +1,102 @@
+# Java Language Configuration
+# Includes code (tree-sitter) and config files (pom.xml, build.gradle)
+
+language: java
+
+code:
+  extensions:
+    - .java
+  parser: tree_sitter_java
+  queries:
+    imports: |
+      (import_declaration
+        (scoped_identifier) @import)
+    
+    definitions: |
+      [
+        (class_declaration
+          name: (identifier) @class.name) @class.def
+        (method_declaration
+          name: (identifier) @method.name) @method.def
+      ]
+    
+    calls: |
+      [
+        (method_invocation
+          name: (identifier) @call.name)
+        (object_creation_expression
+          type: (_) @instantiation.name)
+      ]
+
+  extraction:
+    imports:
+      full_import_capture: import
+      split_on: "."
+      symbol_index: -1
+      module_index: ":-1"
+      
+    definitions:
+      class:
+        name_capture: class.name
+        node_capture: class.def
+        kind: CLASS
+      method:
+        name_capture: method.name
+        node_capture: method.def
+        kind: METHOD
+        
+    calls:
+      method:
+        name_capture: call.name
+        kind: CALL
+      instantiation:
+        name_capture: instantiation.name
+        kind: INSTANTIATION
+        strip_generics: true
+
+configs:
+  - name: maven_pom
+    files:
+      - pom.xml
+    parser: xml
+    extraction:
+      dependencies:
+        xpath: //dependency/artifactId
+        kind: MAVEN_DEPENDENCY
+        group_xpath: //dependency/groupId
+      plugins:
+        xpath: //plugin/artifactId
+        kind: MAVEN_PLUGIN
+      properties:
+        xpath: //properties/*
+        kind: MAVEN_PROPERTY
+        extract: both
+      project_info:
+        groupId:
+          xpath: /project/groupId
+          kind: PROJECT_GROUP
+        artifactId:
+          xpath: /project/artifactId
+          kind: PROJECT_ARTIFACT
+        version:
+          xpath: /project/version
+          kind: PROJECT_VERSION
+
+  - name: gradle_build
+    files:
+      - build.gradle
+      - build.gradle.kts
+    parser: text_patterns
+    patterns:
+      dependencies:
+        # Simplified regex to avoid YAML issues
+        regex: "(?:implementation|api|compileOnly|runtimeOnly|testImplementation)\\s*[\"']([^\"']+)[\"']"
+        capture_group: 1
+        kind: GRADLE_DEPENDENCY
+      plugins:
+        regex: "id\\s+[\"']([^\"']+)[\"']"
+        capture_group: 1
+        kind: GRADLE_PLUGIN
+      repositories:
+        regex: "(?:maven|jcenter|google|mavenCentral)\\(\\)"
+        kind: GRADLE_REPOSITORY

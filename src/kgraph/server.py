@@ -196,9 +196,34 @@ def find_definitions(name: str) -> str:
     Finds where a class or function is defined.
     Returns file path, line number, and docstring.
     """
+    # 1. Exact match
     nodes = store.find_nodes_by_name(name)
+    
+    # Filter out IMPORT nodes - prioritize actual definitions
+    actual_defs = [n for n in nodes if n['type'] in ['CLASS', 'FUNCTION', 'METHOD']]
+    if actual_defs:
+        nodes = actual_defs
+    
+    # 2. Fuzzy match if no exact match
     if not nodes:
-        return f"No definitions found for '{name}'."
+        # Get all node names (this might be expensive on huge graphs, but okay for now)
+        # Optimization: Use SQL LIKE query
+        conn = store._get_conn()
+        cursor = conn.cursor()
+        cursor.execute("SELECT name FROM nodes WHERE name LIKE ? AND type IN ('CLASS', 'FUNCTION', 'METHOD')", (f"%{name}%",))
+        matches = cursor.fetchall()
+        fuzzy_names = [m[0] for m in matches]
+        
+        # Limit to top 5
+        fuzzy_names = fuzzy_names[:5]
+        
+        for fuzzy_name in fuzzy_names:
+            fuzzy_nodes = store.find_nodes_by_name(fuzzy_name)
+            # Again, filter to actual definitions
+            nodes.extend([n for n in fuzzy_nodes if n['type'] in ['CLASS', 'FUNCTION', 'METHOD']])
+            
+    if not nodes:
+        return f"No definitions found for '{name}'.'"
     
     results = []
     for node in nodes:
@@ -350,31 +375,39 @@ def get_usage_context(symbol: str) -> str:
         context.append(f"Docstring: {doc}")
         
     # 2. Find References (Incoming CALLS)
-    # We need to query edges where target is target_id    # 2. Find References (Incoming CALLS)
     callers = store.get_related(target_id, edge_type="CALLS", direction="in")
     context.append(f"Used by ({len(callers)}):")
     for c in callers[:5]:
-        context.append(f"  - {c['name']} in {os.path.basename(c['file_path'])}")
+        name = c.get('name', 'Unknown')
+        file_path = c.get('file_path', '')
+        fname = os.path.basename(file_path) if file_path else 'Unknown File'
+        context.append(f"  - {name} in {fname}")
         
     # 3. Find Outgoing Calls
     calls = store.get_related(target_id, edge_type="CALLS", direction="out")
     context.append(f"Calls ({len(calls)}):")
     for c in calls[:5]:
-        context.append(f"  - {c['name']}")
+        name = c.get('name', 'Unknown')
+        context.append(f"  - {name}")
 
     # 4. Find Importers
     importers = store.get_related(target_id, edge_type="IMPORTS", direction="in")
     if importers:
         context.append(f"Imported by ({len(importers)}):")
         for imp in importers[:5]:
-            context.append(f"  - {os.path.basename(imp['file_path'])}")
+            file_path = imp.get('file_path', '')
+            fname = os.path.basename(file_path) if file_path else 'Unknown File'
+            context.append(f"  - {fname}")
             
     # 5. Find Inheritors
     inheritors = store.get_related(target_id, edge_type="INHERITS_FROM", direction="in")
     if inheritors:
         context.append(f"Inherited by ({len(inheritors)}):")
         for inh in inheritors[:5]:
-            context.append(f"  - {inh['name']} in {os.path.basename(inh['file_path'])}")
+            name = inh.get('name', 'Unknown')
+            file_path = inh.get('file_path', '')
+            fname = os.path.basename(file_path) if file_path else 'Unknown File'
+            context.append(f"  - {name} in {fname}")
         
     return "\n".join(context)
 
@@ -498,6 +531,11 @@ def validate_edit(file_path: str, new_content: str) -> str:
         
     return response
 
+def main():
+    """Entry point for the application script"""
+    mcp.run(transport="stdio")
+
 # Run the server
 if __name__ == "__main__":
-    mcp.run(transport="stdio")
+    main()
+

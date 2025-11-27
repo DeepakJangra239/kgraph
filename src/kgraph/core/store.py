@@ -257,6 +257,17 @@ class GraphStore:
             results.append(d)
         return results
 
+    def get_nodes_by_type(self, node_type: str) -> List[Dict[str, Any]]:
+        conn = self._get_conn()
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM nodes WHERE type = ?", (node_type,))
+        results = []
+        for row in cursor.fetchall():
+            d = dict(row)
+            d['properties'] = json.loads(d['properties']) if d['properties'] else {}
+            results.append(d)
+        return results
+
     def search_nodes_keyword(self, query: str, limit: int = 5) -> List[Dict[str, Any]]:
         """Performs exact keyword search using SQLite."""
         conn = self._get_conn()

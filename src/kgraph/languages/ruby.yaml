@@ -1,0 +1,53 @@
+# Ruby Language Configuration
+# Tree-sitter queries for code extraction
+
+language: ruby
+extensions:
+  - .rb
+
+parser: tree_sitter_ruby
+
+queries:
+  imports: |
+    (call
+      method: (identifier) @method
+      arguments: (argument_list
+        (string
+          (string_content) @require.path)))
+  
+  definitions: |
+    [
+      (method
+        name: (_) @method.name) @method.def
+      (class
+        name: (constant) @class.name) @class.def
+      (module
+        name: (constant) @module.name) @module.def
+    ]
+  
+  calls: |
+    (call
+      method: (identifier) @call.name)
+
+extraction:
+  imports:
+    path_capture: require.path
+    method_filter: ["require", "require_relative"]
+    
+  definitions:
+    method:
+      name_capture: method.name
+      node_capture: method.def
+      kind: METHOD
+    class:
+      name_capture: class.name
+      node_capture: class.def
+      kind: CLASS
+    module:
+      name_capture: module.name
+      node_capture: module.def
+      kind: MODULE
+      
+  calls:
+    name_capture: call.name
+    kind: CALL

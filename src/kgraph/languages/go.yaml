@@ -1,0 +1,53 @@
+# Go Language Configuration
+# Tree-sitter queries for code extraction
+
+language: go
+extensions:
+  - .go
+
+parser: tree_sitter_go
+
+queries:
+  imports: |
+    (import_spec
+      path: (interpreted_string_literal) @import.path)
+  
+  definitions: |
+    [
+      (function_declaration
+        name: (identifier) @func.name) @func.def
+      (method_declaration
+        name: (field_identifier) @method.name) @method.def
+      (type_declaration
+        (type_spec
+          name: (type_identifier) @type.name)) @type.def
+    ]
+  
+  calls: |
+    (call_expression
+      function: (identifier) @call.name)
+
+extraction:
+  imports:
+    path_capture: import.path
+    strip_quotes: true
+    split_on: "/"
+    symbol_index: -1
+    
+  definitions:
+    function:
+      name_capture: func.name
+      node_capture: func.def
+      kind: FUNCTION
+    method:
+      name_capture: method.name
+      node_capture: method.def
+      kind: METHOD
+    type:
+      name_capture: type.name
+      node_capture: type.def
+      kind: TYPE
+      
+  calls:
+    name_capture: call.name
+    kind: CALL

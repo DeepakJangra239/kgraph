@@ -1,0 +1,119 @@
+# TypeScript/JavaScript Language Configuration
+# Includes code (tree-sitter) and config files (package.json)
+
+language: typescript
+
+code:
+  extensions:
+    - .ts
+    - .tsx
+  parser: tree_sitter_typescript
+  parser_factory: language_typescript
+  queries:
+    imports: |
+      (import_statement
+        (import_clause
+          (named_imports
+            (import_specifier
+              name: (identifier) @symbol)))
+        source: (string) @source)
+      
+      (import_statement
+        (import_clause
+          (identifier) @symbol)
+        source: (string) @source)
+    
+    definitions: |
+      [
+        (function_declaration
+          name: (identifier) @func.name) @func.def
+        (class_declaration
+          name: (type_identifier) @class.name) @class.def
+        (method_definition
+          name: (property_identifier) @method.name) @method.def
+        (variable_declarator
+          name: (identifier) @func.name
+          value: [(arrow_function) (function_expression)]) @func.def
+      ]
+    
+    calls: |
+      [
+        (call_expression
+          function: (identifier) @call.name)
+        (call_expression
+          function: (member_expression
+            property: (property_identifier) @call.name))
+        (new_expression
+          constructor: (_) @instantiation.name)
+      ]
+    
+    jsx_components: |
+      [
+        (jsx_self_closing_element
+          name: (identifier) @jsx.component)
+        (jsx_element
+          open_tag: (jsx_opening_element
+            name: (identifier) @jsx.component))
+      ]
+
+  extraction:
+    imports:
+      symbol_capture: symbol
+      source_capture: source
+      requires_source: true
+      strip_quotes: true
+      
+    definitions:
+      function:
+        name_capture: func.name
+        node_capture: func.def
+        kind: FUNCTION
+      class:
+        name_capture: class.name
+        node_capture: class.def
+        kind: CLASS
+      method:
+        name_capture: method.name
+        node_capture: method.def
+        kind: FUNCTION
+        
+    calls:
+      function:
+        name_capture: call.name
+        kind: CALL
+      instantiation:
+        name_capture: instantiation.name
+        kind: INSTANTIATION
+        split_on: "."
+        symbol_index: -1
+      jsx:
+        name_capture: jsx.component
+        kind: JSX_COMPONENT
+        filter_uppercase: true
+
+configs:
+  - name: package_json
+    files:
+      - package.json
+    parser: json
+    extraction:
+      dependencies:
+        path: dependencies
+        extract: keys
+        kind: NPM_DEPENDENCY
+      devDependencies:
+        path: devDependencies
+        extract: keys
+        kind: NPM_DEV_DEPENDENCY
+      scripts:
+        path: scripts
+        extract: keys
+        kind: NPM_SCRIPT
+      name:
+        path: name
+        extract: value
+        kind: PROJECT_NAME
+      version:
+        path: version
+        extract: value
+        kind: PROJECT_VERSION

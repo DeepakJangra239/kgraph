@@ -1,0 +1,57 @@
+# C++ Language Configuration
+# Tree-sitter queries for code extraction
+
+language: cpp
+extensions:
+  - .cpp
+  - .cc
+  - .cxx
+  - .hpp
+  - .h
+  - .hxx
+
+parser: tree_sitter_cpp
+
+queries:
+  imports: |
+    (preproc_include
+      path: (_) @include.path)
+  
+  definitions: |
+    [
+      (function_definition
+        declarator: (function_declarator
+          declarator: (identifier) @func.name)) @func.def
+      (class_specifier
+        name: (type_identifier) @class.name) @class.def
+      (struct_specifier
+        name: (type_identifier) @struct.name) @struct.def
+    ]
+  
+  calls: |
+    (call_expression
+      function: (identifier) @call.name)
+
+extraction:
+  imports:
+    path_capture: include.path
+    strip_quotes: true
+    strip_angle_brackets: true
+    
+  definitions:
+    function:
+      name_capture: func.name
+      node_capture: func.def
+      kind: FUNCTION
+    class:
+      name_capture: class.name
+      node_capture: class.def
+      kind: CLASS
+    struct:
+      name_capture: struct.name
+      node_capture: struct.def
+      kind: STRUCT
+      
+  calls:
+    name_capture: call.name
+    kind: CALL

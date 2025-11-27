@@ -1,0 +1,59 @@
+# PHP Language Configuration
+# Tree-sitter queries for code extraction
+
+language: php
+extensions:
+  - .php
+
+parser: tree_sitter_php
+
+queries:
+  imports: |
+    (namespace_use_clause
+      (_) @import)
+  
+  definitions: |
+    [
+      (function_definition
+        name: (name) @func.name) @func.def
+      (class_declaration
+        name: (name) @class.name) @class.def
+      (method_declaration
+        name: (name) @method.name) @method.def
+    ]
+  
+  calls: |
+    [
+      (function_call_expression
+        function: (name) @call.name)
+      (object_creation_expression
+        (_) @instantiation.name)
+    ]
+
+extraction:
+  imports:
+    full_import_capture: import
+    split_on: "\\"
+    symbol_index: -1
+    
+  definitions:
+    function:
+      name_capture: func.name
+      node_capture: func.def
+      kind: FUNCTION
+    class:
+      name_capture: class.name
+      node_capture: class.def
+      kind: CLASS
+    method:
+      name_capture: method.name
+      node_capture: method.def
+      kind: METHOD
+      
+  calls:
+    function:
+      name_capture: call.name
+      kind: CALL
+    instantiation:
+      name_capture: instantiation.name
+      kind: INSTANTIATION
