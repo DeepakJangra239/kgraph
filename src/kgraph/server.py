@@ -15,6 +15,80 @@ mcp = FastMCP("KnowledgeGraph")
 # Global store and indexer (will be reinitialized per project)
 store = None
 indexer = None
+observer = None
+current_watch_path = None
+
+try:
+    from watchdog.observers import Observer
+    from watchdog.events import FileSystemEventHandler
+    WATCHDOG_AVAILABLE = True
+except ImportError:
+    WATCHDOG_AVAILABLE = False
+    print("[WARNING] watchdog not installed. Automatic updates disabled.", file=sys.stderr)
+
+class CodeEventHandler(FileSystemEventHandler):
+    def __init__(self, indexer_instance):
+        self.indexer = indexer_instance
+        self.last_events = {}
+        
+    def _process(self, event):
+        if event.is_directory:
+            return
+            
+        # Ignore .kgraph and other hidden directories
+        if "/.kgraph/" in event.src_path or "/." in event.src_path:
+            return
+            
+        # Simple debounce/deduplicate
+        import time
+        current_time = time.time()
+        if event.src_path in self.last_events:
+            if current_time - self.last_events[event.src_path] < 1.0:
+                return
+        self.last_events[event.src_path] = current_time
+        
+        try:
+            if event.event_type == 'deleted':
+                self.indexer.remove_file(event.src_path)
+            elif event.event_type in ['created', 'modified']:
+                self.indexer.update_file(event.src_path)
+            elif event.event_type == 'moved':
+                self.indexer.remove_file(event.src_path)
+                self.indexer.update_file(event.dest_path)
+        except Exception as e:
+            print(f"[ERROR] Error processing file event {event}: {e}", file=sys.stderr)
+
+    def on_modified(self, event):
+        self._process(event)
+    
+    def on_created(self, event):
+        self._process(event)
+        
+    def on_deleted(self, event):
+        self._process(event)
+        
+    def on_moved(self, event):
+        self._process(event)
+
+def start_watcher(path, indexer_instance):
+    global observer, current_watch_path
+    
+    if not WATCHDOG_AVAILABLE:
+        return
+        
+    if observer and current_watch_path == path:
+        return # Already watching
+        
+    if observer:
+        observer.stop()
+        observer.join()
+        
+    current_watch_path = path
+    event_handler = CodeEventHandler(indexer_instance)
+    observer = Observer()
+    observer.schedule(event_handler, path, recursive=True)
+    observer.start()
+    print(f"[INFO] Started file watcher for {path}", file=sys.stderr)
 
 def get_or_create_store_for_path(root_path: str) -> tuple[GraphStore, CodeIndexer]:
     """Get or create a GraphStore and CodeIndexer for a specific project path."""
@@ -36,6 +110,9 @@ def get_or_create_store_for_path(root_path: str) -> tuple[GraphStore, CodeIndexe
         print(f"[INFO] Database: {db_path}", file=sys.stderr)
         store = GraphStore(db_path=db_path, lancedb_path=lancedb_path)
         indexer = CodeIndexer(store)
+        
+    # Ensure watcher is running for this path
+    start_watcher(root_path, indexer)
     
     return store, indexer
 

@@ -17,6 +17,7 @@ dependencies = [
     "lance-namespace==0.0.21",
     "sentence-transformers",
     "numpy",
+    "watchdog",
 ]
 
 [project.optional-dependencies]

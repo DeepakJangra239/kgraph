@@ -172,6 +172,18 @@ class GraphStore:
             
             # Insert into LanceDB
             # Insert into LanceDB with robust error handling
+            # First, delete existing vectors for these files to prevent duplicates/bloat
+            # We group by file_path to make deletion efficient
+            if self.table:
+                try:
+                    files_to_update = set(node['file_path'] for node in nodes_with_code)
+                    for file_path in files_to_update:
+                        # Escape single quotes
+                        safe_path = file_path.replace("'", "''")
+                        self.table.delete(f"file_path = '{safe_path}'")
+                except Exception as e:
+                    logger.warning(f"Error deleting old vectors: {e}")
+
             max_retries = 3
             for attempt in range(max_retries):
                 try:
@@ -247,6 +259,58 @@ class GraphStore:
             d['properties'] = json.loads(d['properties']) if d['properties'] else {}
             return d
         return None
+
+    def remove_file_data(self, file_path: str):
+        """Removes all nodes, edges, and vectors associated with a file."""
+        conn = self._get_conn()
+        cursor = conn.cursor()
+        
+        # 1. Get IDs to delete (for edge cleanup)
+        cursor.execute("SELECT id FROM nodes WHERE file_path = ?", (file_path,))
+        rows = cursor.fetchall()
+        if not rows:
+            return
+            
+        ids = [row[0] for row in rows]
+        
+        # 2. Delete from SQLite
+        # Delete nodes
+        cursor.execute("DELETE FROM nodes WHERE file_path = ?", (file_path,))
+        
+        # Delete edges where source is in this file
+        # Note: We can't easily use "WHERE source_id IN ..." with a list in SQL without formatting
+        # But we can use a subquery if we hadn't just deleted the nodes.
+        # Since we deleted nodes, we can't use subquery on nodes table.
+        # Actually, we should have done edges first or used CASCADE if we had foreign keys (we don't).
+        
+        # Let's use the IDs list.
+        if ids:
+            placeholders = ','.join(['?'] * len(ids))
+            cursor.execute(f"DELETE FROM edges WHERE source_id IN ({placeholders})", ids)
+            
+        conn.commit()
+        
+        # 3. Delete from LanceDB
+        if self.table:
+            try:
+                # Escape single quotes in file path for SQL-like filter
+                safe_path = file_path.replace("'", "''")
+                self.table.delete(f"file_path = '{safe_path}'")
+            except Exception as e:
+                logger.error(f"Error deleting from LanceDB: {e}")
+
+    def compact(self):
+        """Compacts the LanceDB table to reclaim space."""
+        if self.table:
+            try:
+                logger.info("Compacting LanceDB table...")
+                # Force cleanup of ALL old versions immediately
+                from datetime import timedelta
+                self.table.cleanup_old_versions(older_than=timedelta(seconds=0))
+                self.table.compact_files()
+                logger.info("Compaction complete.")
+            except Exception as e:
+                logger.warning(f"Error compacting LanceDB: {e}")
 
     def get_related(self, node_id: str, edge_type: str = None, direction: str = "out") -> List[Dict[str, Any]]:
         conn = self._get_conn()
